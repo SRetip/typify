@@ -5,6 +5,8 @@
 #![deny(missing_docs)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
+use std::path::PathBuf;
 
 use conversions::SchemaCache;
 use log::info;
@@ -206,6 +208,15 @@ pub struct TypeSpace {
 
     // Shared functions for generating default values
     defaults: BTreeSet<DefaultImpl>,
+
+    file_path: PathBuf,
+}
+
+impl TypeSpace {
+    ///doc
+    pub fn with_path<T: Into<PathBuf>>(&mut self, path: T) {
+        self.file_path = path.into();
+    }
 }
 
 impl Default for TypeSpace {
@@ -224,6 +235,7 @@ impl Default for TypeSpace {
             settings: Default::default(),
             cache: Default::default(),
             defaults: Default::default(),
+            file_path: Default::default(),
         }
     }
 }
@@ -614,6 +626,81 @@ impl TypeSpace {
             .and_then(|m| m.title.as_ref())
             .is_some();
 
+        let mut external_references = vec![];
+        for def in &defs {
+            for reference in get_references(&def.1) {
+                if reference.starts_with("#") {
+                    continue;
+                }
+                let mut index = 0;
+                for (c1, c2) in schema
+                    .extensions
+                    .get("id")
+                    .expect("missing 'id' attribute in schema definition")
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .zip(reference.chars())
+                {
+                    if c1 != c2 {
+                        break;
+                    }
+                    index += 1;
+                }
+                let difference = &reference[index..];
+                let file_path = self.file_path.parent().unwrap().join(
+                    difference
+                        .split("#")
+                        .next()
+                        .expect("expect '#' before path to external reference"),
+                );
+                let content = std::fs::read_to_string(&file_path).expect(&format!(
+                    "Failed to open input file: {}",
+                    &file_path.display()
+                ));
+
+                let root_schema = serde_json::from_str::<RootSchema>(&content)
+                    .expect("Failed to parse input file as JSON Schema");
+
+                let definition_schema = root_schema
+                    .definitions
+                    .get(
+                        reference
+                            .split('/')
+                            .last()
+                            .expect("unexpected end of reference"),
+                    )
+                    .unwrap()
+                    .clone();
+                external_references.push((
+                    RefKey::Def(
+                        reference
+                            .split('/')
+                            .last()
+                            .expect("unexpected end of reference")
+                            .to_string(),
+                    ),
+                    definition_schema.clone(),
+                ));
+                let id = root_schema
+                    .schema
+                    .extensions
+                    .get("id")
+                    .as_ref()
+                    .expect("missing 'id' attribute in schema definition")
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                fetch_external_definitions(
+                    &root_schema,
+                    definition_schema,
+                    file_path,
+                    &id,
+                    &mut external_references,
+                );
+            }
+        }
+        defs.extend(external_references.into_iter());
         if root_type {
             defs.push((RefKey::Root, schema.into()));
         }
@@ -1002,6 +1089,137 @@ impl<'a> TypeNewtype<'a> {
     /// Get the inner type of the newtype struct.
     pub fn inner(&self) -> TypeId {
         self.details.type_id.clone()
+    }
+}
+
+fn fetch_external_definitions(
+    base_schema: &RootSchema,
+    definition: Schema,
+    base_path: PathBuf,
+    base_id: &str,
+    external_references: &mut Vec<(RefKey, Schema)>,
+) {
+    for reference in get_references(&definition) {
+        if reference.starts_with("#") {
+            let d = base_schema
+                .definitions
+                .get(reference.split('/').last().unwrap())
+                .cloned()
+                .unwrap();
+            external_references.push((
+                RefKey::Def(
+                    reference
+                        .split('/')
+                        .last()
+                        .expect("unexpected end of reference")
+                        .to_string(),
+                ),
+                d.clone(),
+            ));
+            fetch_external_definitions(
+                base_schema,
+                d.clone(),
+                base_path.clone(),
+                base_id,
+                external_references,
+            );
+        } else {
+            let mut index = 0;
+            for (c1, c2) in base_id.chars().zip(reference.chars()) {
+                if c1 != c2 {
+                    break;
+                }
+                index += 1;
+            }
+            let difference = &reference[index..];
+            let file_path = base_path.parent().unwrap().join(
+                difference
+                    .split("#")
+                    .next()
+                    .expect("expect '#' before path to external reference"),
+            );
+            let content = std::fs::read_to_string(&file_path).expect(&format!(
+                "Failed to open input file: {}",
+                &file_path.display()
+            ));
+
+            let root_schema = serde_json::from_str::<RootSchema>(&content)
+                .expect("Failed to parse input file as JSON Schema");
+
+            let definition_schema = root_schema
+                .definitions
+                .get(
+                    reference
+                        .split('/')
+                        .last()
+                        .expect("unexpected end of reference"),
+                )
+                .unwrap()
+                .clone();
+            external_references.push((
+                RefKey::Def(
+                    reference
+                        .split('/')
+                        .last()
+                        .expect("unexpected end of reference")
+                        .to_string(),
+                ),
+                definition_schema.clone(),
+            ));
+            let id = root_schema
+                .schema
+                .extensions
+                .get("id")
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            fetch_external_definitions(
+                &root_schema,
+                definition_schema,
+                file_path,
+                id.as_str(),
+                external_references,
+            )
+        }
+    }
+}
+
+fn get_references(schema: &Schema) -> Vec<String> {
+    match schema {
+        Schema::Object(obj) => {
+            let mut result = vec![];
+            obj.clone()
+              .reference
+              .map(|reference| result.push(reference));
+            if let Some(o) = &obj.object {
+                let prop_refs = o
+                  .properties
+                  .values()
+                  .into_iter()
+                  .map(|p| get_references(p))
+                  .flatten()
+                  .collect::<Vec<_>>();
+                if let Some(additional_props) = &o.additional_properties {
+                    result.extend(get_references(&additional_props));
+                }
+                let pattern_refs = o
+                  .pattern_properties
+                  .values()
+                  .into_iter()
+                  .map(|p| get_references(p))
+                  .flatten()
+                  .collect::<Vec<_>>();
+                if let Some(property_names) = &o.property_names {
+                    result.extend(get_references(&property_names))
+                }
+                result.extend(prop_refs);
+                result.extend(pattern_refs);
+            }
+            result
+        }
+        _ => vec![],
     }
 }
 
